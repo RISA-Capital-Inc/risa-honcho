@@ -122,7 +122,6 @@ async def process_representation_tasks_batch(
         )
         for idx, msg in enumerate(messages)
     )
-    prompt_message_ids = [msg.public_id for msg in messages]
 
     # Track token usage - count only tokens from messages being processed
     prompt_tokens = estimate_deriver_prompt_tokens(custom_instructions)
@@ -236,7 +235,6 @@ async def process_representation_tasks_batch(
     observations = Representation.from_prompt_representation(
         response.content,
         message_ids,
-        prompt_message_ids,
         latest_message.session_name,
         latest_message.created_at,
     )
@@ -286,12 +284,32 @@ async def process_representation_tasks_batch(
                 agg_representation_result.semantic_dup_replaced_count += (
                     representation_result.semantic_dup_replaced_count
                 )
+                # Row-level rejections are carried, never dropped: an
+                # oversized document must be visible in the batch aggregate so
+                # the caller can record it against the queue item.
+                agg_representation_result.rejected_documents.extend(
+                    representation_result.rejected_documents
+                )
                 successful_observer_count += 1
             except Exception as e:  # noqa: BLE001
                 logger.exception(
                     "Failed to save representation for observer %s", observer
                 )
                 save_errors.append((observer, e))
+
+    obs_rejections = agg_representation_result.rejected_documents
+    if obs_rejections:
+        rejected = obs_rejections
+        logger.error(
+            "Deriver rejected %d of %d derived document(s) for messages %s:%s in %s/%s: %s",
+            len(rejected),
+            len(observations.explicit) + len(observations.deductive),
+            earliest_message.id,
+            latest_message.id,
+            latest_message.workspace_name,
+            latest_message.session_name,
+            "; ".join(f"{r.level}: {r.reason}" for r in rejected[:5]),
+        )
 
     # Log metrics
     overall_duration = (time.perf_counter() - overall_start) * 1000
@@ -410,3 +428,12 @@ async def process_representation_tasks_batch(
             f"save_representation failed for all {len(save_errors)} observer(s): "
             + details
         ) from save_errors[0][1]
+
+    if not save_errors and successful_observer_count == 0 and obs_rejections:
+        # Saves technically succeeded but every document was refused (e.g. all
+        # over the content cap). Nothing was persisted, so this must surface as
+        # a queue-row error rather than processed=true / error NULL.
+        raise RepresentationSaveError(
+            f"all {len(obs_rejections)} derived document(s) were rejected: "
+            + "; ".join(r.reason for r in obs_rejections[:3])
+        )

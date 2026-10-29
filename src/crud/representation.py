@@ -6,12 +6,15 @@ import time
 from contextlib import suppress
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from src import crud, exceptions, models, schemas
 from src.config import settings
+from src.constants import MAX_DOCUMENT_CONTENT_LENGTH
+from src.crud.document import DocumentRejection
 from src.dependencies import tracked_db
 from src.dreamer.dream_scheduler import check_and_schedule_dream
 from src.embedding_client import EmbeddingTokenLimitError, embedding_client
@@ -192,10 +195,13 @@ class RepresentationManager:
         )
 
         # Prepare all documents for bulk creation
+        # The schema enforces the same content cap as the table, so an
+        # over-cap observation is refused here — one row at a time, never the
+        # whole batch.
         documents_to_create: list[schemas.DocumentCreate] = []
+        boundary_rejections: list[DocumentRejection] = []
         for obs, embedding in zip(all_observations, embeddings, strict=True):
             # NOTE: will add additional levels of reasoning in the future
-            source_message_ids: list[str] | None = None
             if isinstance(obs, DeductiveObservation):
                 obs_level = "deductive"
                 obs_content = obs.conclusion
@@ -204,7 +210,6 @@ class RepresentationManager:
                 obs_level = "explicit"
                 obs_content = obs.content
                 obs_premises = None
-                source_message_ids = obs.source_message_ids or None
 
             metadata: schemas.DocumentMetadata = schemas.DocumentMetadata(
                 message_ids=message_ids,
@@ -212,25 +217,56 @@ class RepresentationManager:
                 message_created_at=format_datetime_utc(message_created_at),
             )
 
-            documents_to_create.append(
-                schemas.DocumentCreate(
-                    content=obs_content,
-                    session_name=session_name,
-                    level=obs_level,
-                    metadata=metadata,
-                    embedding=embedding,
-                    source_message_ids=source_message_ids,
+            try:
+                documents_to_create.append(
+                    schemas.DocumentCreate(
+                        content=obs_content,
+                        session_name=session_name,
+                        level=obs_level,
+                        metadata=metadata,
+                        embedding=embedding,
+                    )
                 )
-            )
+            except ValidationError:
+                boundary_rejections.append(
+                    DocumentRejection(
+                        reason=(
+                            f"content length {len(obs_content)} exceeds the "
+                            f"documents.content limit of {MAX_DOCUMENT_CONTENT_LENGTH} "
+                            "characters"
+                        ),
+                        constraint="ck_documents_content_length",
+                        content_length=len(obs_content),
+                        level=obs_level,
+                        session_name=session_name,
+                        content_prefix=obs_content[:80],
+                    )
+                )
+                logger.error(
+                    "Refusing oversized %s observation (%d characters) for %s/%s/%s",
+                    obs_level,
+                    len(obs_content),
+                    self.workspace_name,
+                    self.observer,
+                    self.observed,
+                )
 
-        # Use bulk creation with optional duplicate detection
-        accepted_documents_result = await crud.create_documents(
-            db,
-            documents_to_create,
-            self.workspace_name,
-            observer=self.observer,
-            observed=self.observed,
-            deduplicate=settings.DERIVER.DEDUPLICATE,
+        # Use bulk creation with optional duplicate detection. Nothing to
+        # insert still means a result: the boundary rejections must reach the
+        # caller so a queue row can record them.
+        if documents_to_create:
+            accepted_documents_result = await crud.create_documents(
+                db,
+                documents_to_create,
+                self.workspace_name,
+                observer=self.observer,
+                observed=self.observed,
+                deduplicate=settings.DERIVER.DEDUPLICATE,
+            )
+        else:
+            accepted_documents_result = crud.CreateDocumentsResult()
+        accepted_documents_result.rejected_documents = (
+            boundary_rejections + accepted_documents_result.rejected_documents
         )
 
         if message_level_configuration.dream.enabled:

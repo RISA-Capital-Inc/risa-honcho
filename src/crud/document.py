@@ -1,6 +1,8 @@
 import asyncio
 import datetime
+import re
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from logging import getLogger
@@ -15,6 +17,7 @@ from sqlalchemy.sql.functions import func
 
 from src import models, schemas
 from src.config import settings
+from src.constants import MAX_DOCUMENT_CONTENT_LENGTH
 from src.crud.collection import get_or_create_collection
 from src.crud.peer import get_peer, reject_scope_observed
 from src.crud.session import get_session
@@ -51,28 +54,6 @@ def build_source_links(
         for i, sid in enumerate(dict.fromkeys(source_ids))
         if models.SOURCE_ID_RE.match(sid)
     ]
-
-
-def build_source_message_links(
-    message_ids: list[str] | None, workspace_name: str
-) -> list[models.ConclusionSourceMessage]:
-    """Convert cited message public ids to ConclusionSourceMessage rows, deduped."""
-    if not message_ids:
-        return []
-    return [
-        models.ConclusionSourceMessage(
-            message_id=mid, position=i, workspace_name=workspace_name
-        )
-        for i, mid in enumerate(dict.fromkeys(message_ids))
-        if models.SOURCE_ID_RE.match(mid)
-    ]
-
-
-def _merge_citations(
-    first: list[str] | None, incoming: list[str] | None
-) -> list[str] | None:
-    """Union two citation lists, keeping first-seen order; None when both empty."""
-    return list(dict.fromkeys([*(first or []), *(incoming or [])])) or None
 
 
 def get_all_documents(
@@ -655,6 +636,62 @@ class _DocumentRowOp:
     fallback_document: schemas.DocumentCreate | None = None
 
 
+# The cap is defined once in src.constants and consumed by models.Document's
+# CHECK constraint, schemas.DocumentCreate and this module, so the API boundary
+# and the table cannot drift apart again.
+_CONTENT_LENGTH_CONSTRAINT = "ck_documents_content_length"
+
+
+@dataclass(frozen=True)
+class DocumentRejection:
+    """A document that could not be persisted, and why.
+
+    Row-level by construction: the batch keeps going, and the caller can report
+    exactly which documents were dropped and for what reason instead of losing
+    every sibling in the same insert.
+    """
+
+    reason: str
+    constraint: str | None = None
+    content_length: int | None = None
+    level: str | None = None
+    session_name: str | None = None
+    content_prefix: str = ""
+
+
+def _constraint_name(exc: IntegrityError) -> str | None:
+    """Best-effort constraint name from a psycopg IntegrityError."""
+    orig = getattr(exc, "orig", None)
+    diag = getattr(orig, "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    if name:
+        return str(name)
+    match = re.search(r'constraint "([^"]+)"', str(orig or exc))
+    return match.group(1) if match else None
+
+
+def _rejection_for(
+    document: schemas.DocumentCreate, exc: IntegrityError
+) -> DocumentRejection:
+    """Describe one row-level insert failure without losing the row's identity."""
+    constraint = _constraint_name(exc)
+    if constraint == _CONTENT_LENGTH_CONSTRAINT:
+        reason = (
+            f"content length {len(document.content)} exceeds the documents.content "
+            f"limit of {MAX_DOCUMENT_CONTENT_LENGTH} characters"
+        )
+    else:
+        reason = f"integrity constraint violation ({constraint or 'unknown constraint'})"
+    return DocumentRejection(
+        reason=reason,
+        constraint=constraint,
+        content_length=len(document.content),
+        level=document.level,
+        session_name=document.session_name,
+        content_prefix=document.content[:80],
+    )
+
+
 @dataclass
 class CreateDocumentsResult:
     created_documents: list[schemas.DocumentCreate] = field(default_factory=list)
@@ -662,6 +699,14 @@ class CreateDocumentsResult:
     exact_dup_existing_count: int = 0
     semantic_dup_rejected_count: int = 0
     semantic_dup_replaced_count: int = 0
+    # Documents that were refused at insert time. Always surfaced to the caller
+    # so a rejected row can never look like a successful, empty result.
+    rejected_documents: list[DocumentRejection] = field(default_factory=list)
+
+    @property
+    def rejected_count(self) -> int:
+        """Number of documents refused by row-level constraints."""
+        return len(self.rejected_documents)
 
 
 async def create_documents(
@@ -694,6 +739,7 @@ async def create_documents(
     """
     honcho_documents: list[models.Document] = []
     accepted_documents: list[schemas.DocumentCreate] = []
+    rejected_documents: list[DocumentRejection] = []
     # Store (document_model, embedding) pairs - IDs aren't available until after commit
     docs_with_embeddings: list[tuple[models.Document, list[float]]] = []
 
@@ -810,15 +856,9 @@ async def create_documents(
                 existing_doc,
             )
 
-    # First document seen per dedup key, so exact duplicates within a single
-    # inference call collapse to one document. A collapsed duplicate's
-    # citations fold into the first one, and into its pending row if any.
-    first_in_batch: dict[tuple[str, str, str | None], schemas.DocumentCreate] = {}
-    pending_by_key: dict[tuple[str, str, str | None], models.Document] = {}
-    # Existing row id -> the incoming document replacing it, by its dedup key.
-    replaced_by: dict[
-        str, tuple[schemas.DocumentCreate, tuple[str, str, str | None]]
-    ] = {}
+    # Tracks dedup keys already accepted from this batch so exact
+    # duplicates within a single inference call collapse to one document.
+    seen_in_batch: set[tuple[str, str, str | None]] = set()
     row_ops: list[_DocumentRowOp] = []
     pending_times_derived: dict[str, int] = {}
 
@@ -847,21 +887,10 @@ async def create_documents(
 
             # Exact-match dedup, always on:
             # 1) collapse exact duplicates within this batch (drop silently).
-            first_doc = first_in_batch.get(dedup_key)
-            if first_doc is not None:
+            if dedup_key in seen_in_batch:
                 exact_dup_in_batch_count += 1
-                first_doc.source_message_ids = _merge_citations(
-                    first_doc.source_message_ids, doc.source_message_ids
-                )
-                pending_doc = pending_by_key.get(dedup_key)
-                if pending_doc is not None:
-                    # Same validation as the first insert: a malformed id
-                    # would fail the check constraints and the whole batch.
-                    pending_doc.source_message_links = build_source_message_links(
-                        first_doc.source_message_ids, workspace_name
-                    )
                 continue
-            first_in_batch[dedup_key] = doc
+            seen_in_batch.add(dedup_key)
 
             # 2) drop exact duplicates of an existing live document, recording
             #    the re-derivation as reinforcement on the existing row.
@@ -899,13 +928,7 @@ async def create_documents(
                     )
                     doc.times_derived = max(doc.times_derived, current_td + 1)
                     pending_times_derived[existing_dup.id] = doc.times_derived
-                    # The replacement inherits the replaced row's citations,
-                    # as it inherits its derivation count.
-                    doc.source_message_ids = _merge_citations(
-                        existing_dup.source_message_ids, doc.source_message_ids
-                    )
                     row_ops.append(_DocumentRowOp("replace", existing_dup.id))
-                    replaced_by.setdefault(existing_dup.id, (doc, dedup_key))
                     semantic_dup_replaced_count += 1
                 elif (
                     duplicate_result is SemanticRejectionResult.REJECTED
@@ -933,7 +956,6 @@ async def create_documents(
             )
             honcho_documents.append(new_doc)
             accepted_documents.append(doc)
-            pending_by_key[dedup_key] = new_doc
             if doc.embedding:
                 docs_with_embeddings.append((new_doc, doc.embedding))
 
@@ -952,26 +974,6 @@ async def create_documents(
                 f"Error adding new document to {workspace_name}/{doc.session_name}/{observer}/{observed}: {e}"
             )
             continue
-
-    # A reinforce aimed at a row this batch also replaces would land on the
-    # deleted row, or be skipped, depending on op order. Its citations belong
-    # to the replacement.
-    for op in row_ops:
-        if op.kind != "reinforce" or op.fallback_document is None:
-            continue
-        replacement = replaced_by.get(op.document_id)
-        if replacement is None:
-            continue
-        replacement_doc, replacement_key = replacement
-        replacement_doc.source_message_ids = _merge_citations(
-            replacement_doc.source_message_ids,
-            op.fallback_document.source_message_ids,
-        )
-        replacement_row = pending_by_key.get(replacement_key)
-        if replacement_row is not None:
-            replacement_row.source_message_links = build_source_message_links(
-                replacement_doc.source_message_ids, workspace_name
-            )
 
     try:
         fallback_docs = await _apply_document_row_updates(
@@ -992,7 +994,94 @@ async def create_documents(
             accepted_documents.append(fallback_doc)
             if fallback_doc.embedding:
                 docs_with_embeddings.append((new_doc, fallback_doc.embedding))
-        db.add_all(honcho_documents)
+        # Insert row by row inside a SAVEPOINT apiece. Previously the whole
+        # batch went through a single `add_all` + `commit`, so one document
+        # violating a table constraint (e.g. ck_documents_content_length,
+        # 65,535 characters) rolled back every sibling in the same inference
+        # call and surfaced as a single ValidationException callers swallowed —
+        # a silent loss.
+        #
+        # Reject, do not truncate: a truncated document is indistinguishable
+        # from a complete one downstream, and its embedding was computed over
+        # the full text, so persisting a prefix would corrupt both the evidence
+        # record and retrieval.
+        persisted_flags: list[bool] = []
+        for _row_index, _new_doc in enumerate(honcho_documents):
+            _source_doc = accepted_documents[_row_index]
+            if len(_source_doc.content) > MAX_DOCUMENT_CONTENT_LENGTH:
+                persisted_flags.append(False)
+                rejected_documents.append(
+                    DocumentRejection(
+                        reason=(
+                            f"content length {len(_source_doc.content)} exceeds the "
+                            f"documents.content limit of {MAX_DOCUMENT_CONTENT_LENGTH} "
+                            "characters"
+                        ),
+                        constraint=_CONTENT_LENGTH_CONSTRAINT,
+                        content_length=len(_source_doc.content),
+                        level=_source_doc.level,
+                        session_name=_source_doc.session_name,
+                        content_prefix=_source_doc.content[:80],
+                    )
+                )
+                logger.error(
+                    "Refusing oversized document for %s/%s/%s/%s: %d characters > %d",
+                    workspace_name,
+                    _source_doc.session_name,
+                    observer,
+                    observed,
+                    len(_source_doc.content),
+                    MAX_DOCUMENT_CONTENT_LENGTH,
+                )
+                continue
+
+            try:
+                # Nested transaction == SAVEPOINT: a failure here rolls back
+                # this row only, leaving the rest of the batch eligible.
+                async with db.begin_nested():
+                    db.add(_new_doc)
+                    await db.flush()
+            except IntegrityError as _exc:
+                persisted_flags.append(False)
+                rejected_documents.append(_rejection_for(_source_doc, _exc))
+                # A failed flush leaves the instance in the session; expunge it
+                # so the next flush does not retry (and re-fail) the same row.
+                with suppress(Exception):
+                    db.expunge(_new_doc)
+                logger.error(
+                    "Rejected document for %s/%s/%s/%s: %s",
+                    workspace_name,
+                    _source_doc.session_name,
+                    observer,
+                    observed,
+                    rejected_documents[-1].reason,
+                )
+                continue
+            persisted_flags.append(True)
+
+        if not all(persisted_flags):
+            # Keep the reported documents and the vector upserts aligned with
+            # what actually landed: a rejected row must not be reported as
+            # created, and its embedding must not reach the vector store.
+            persisted_ids = {
+                id(_model)
+                for _model, _ok in zip(honcho_documents, persisted_flags, strict=True)
+                if _ok
+            }
+            accepted_documents = [
+                _doc
+                for _doc, _ok in zip(accepted_documents, persisted_flags, strict=True)
+                if _ok
+            ]
+            honcho_documents = [
+                _doc
+                for _doc, _ok in zip(honcho_documents, persisted_flags, strict=True)
+                if _ok
+            ]
+            docs_with_embeddings = [
+                _pair for _pair in docs_with_embeddings if id(_pair[0]) in persisted_ids
+            ]
+
         # NOTE
         # If the process crashes after this commit but before vector upsert completes,
         # documents will be left in sync_state='pending' with NULL embeddings.
@@ -1099,6 +1188,7 @@ async def create_documents(
         exact_dup_in_batch_count=exact_dup_in_batch_count,
         semantic_dup_rejected_count=semantic_dup_rejected_count,
         semantic_dup_replaced_count=semantic_dup_replaced_count,
+        rejected_documents=rejected_documents,
     )
 
 
@@ -1492,9 +1582,6 @@ def _document_model_from_create(
             session_name=doc.session_name,
             embedding=doc.embedding,
             source_links=build_source_links(doc.source_ids, workspace_name),
-            source_message_links=build_source_message_links(
-                doc.source_message_ids, workspace_name
-            ),
         )
     else:
         new_doc = models.Document(
@@ -1507,9 +1594,6 @@ def _document_model_from_create(
             internal_metadata=metadata_dict,
             session_name=doc.session_name,
             source_links=build_source_links(doc.source_ids, workspace_name),
-            source_message_links=build_source_message_links(
-                doc.source_message_ids, workspace_name
-            ),
         )
     if doc.embedding:
         new_doc.sync_state = "pending"
@@ -1543,32 +1627,6 @@ async def _apply_document_row_updates(
         .execution_options(populate_existing=True)
     )
     locked = {doc.id: doc for doc in result.scalars()}
-    # Read the targets' current citations under the row lock: the selectin
-    # collection can predate a concurrent writer's links.
-    cite_ids = sorted(
-        {
-            op.document_id
-            for op in ops
-            if op.kind == "reinforce"
-            and op.fallback_document is not None
-            and op.fallback_document.source_message_ids
-        }
-    )
-    existing_citations: dict[str, list[str]] = {doc_id: [] for doc_id in cite_ids}
-    if cite_ids:
-        citation_rows = await db.execute(
-            select(
-                models.ConclusionSourceMessage.conclusion_id,
-                models.ConclusionSourceMessage.message_id,
-            )
-            .where(models.ConclusionSourceMessage.conclusion_id.in_(cite_ids))
-            .order_by(
-                models.ConclusionSourceMessage.conclusion_id,
-                models.ConclusionSourceMessage.position,
-            )
-        )
-        for conclusion_id, message_id in citation_rows.all():
-            existing_citations[conclusion_id].append(message_id)
     now = datetime.datetime.now(datetime.UTC)
     fallbacks: list[schemas.DocumentCreate] = []
     stale_at_lock = {
@@ -1592,34 +1650,8 @@ async def _apply_document_row_updates(
             # An earlier op in this batch replaced this row.
             continue
         row.times_derived = max(row.times_derived + 1, op.incoming_times_derived)
-        if op.fallback_document is not None:
-            _append_citations(
-                row,
-                existing_citations.get(row.id, []),
-                op.fallback_document.source_message_ids,
-                workspace_name,
-            )
     await db.flush()
     return fallbacks
-
-
-def _append_citations(
-    row: models.Document,
-    existing: list[str],
-    incoming: list[str] | None,
-    workspace_name: str,
-) -> None:
-    """Add the incoming citations a reinforced row lacks, after its own.
-
-    ``existing`` is updated in place, so a second reinforce of the same row in
-    one batch sees the first one's additions.
-    """
-    for link in build_source_message_links(incoming, workspace_name):
-        if link.message_id in existing:
-            continue
-        link.position = len(existing)
-        row.source_message_links.append(link)
-        existing.append(link.message_id)
 
 
 class SemanticRejectionResult(Enum):
