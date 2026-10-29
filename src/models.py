@@ -26,6 +26,7 @@ from sqlalchemy.orm import Mapped, MappedColumn, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from src.config import settings
+from src.constants import MAX_DOCUMENT_CONTENT_LENGTH
 from src.utils.types import DocumentLevel, TaskType, VectorSyncState
 
 from .db import Base
@@ -541,7 +542,10 @@ class Document(Base):
 
     __table_args__ = (
         CheckConstraint("length(id) = 21", name="id_length"),
-        CheckConstraint("length(content) <= 65535", name="content_length"),
+        CheckConstraint(
+            f"length(content) <= {MAX_DOCUMENT_CONTENT_LENGTH}",
+            name="content_length",
+        ),
         CheckConstraint("id ~ '^[A-Za-z0-9_-]+$'", name="id_format"),
         # Composite foreign key constraint for collections
         ForeignKeyConstraint(

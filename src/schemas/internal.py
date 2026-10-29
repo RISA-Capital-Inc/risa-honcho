@@ -8,6 +8,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.constants import MAX_DOCUMENT_CONTENT_LENGTH
 from src.schemas.api import MessageCreate
 from src.schemas.configuration import SessionPeerConfig
 from src.utils.sanitization import NulStripped
@@ -62,7 +63,9 @@ class DocumentMetadata(BaseModel):
 
 
 class DocumentCreate(DocumentBase):
-    content: Annotated[str, Field(min_length=1, max_length=100000), NulStripped]
+    content: Annotated[
+        str, Field(min_length=1, max_length=MAX_DOCUMENT_CONTENT_LENGTH), NulStripped
+    ]
     session_name: str | None = Field(
         default=None,
         description="The session from which the document was derived (NULL for global observations)",

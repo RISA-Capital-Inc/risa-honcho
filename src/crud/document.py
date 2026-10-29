@@ -1,6 +1,8 @@
 import asyncio
 import datetime
+import re
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from logging import getLogger
@@ -15,6 +17,7 @@ from sqlalchemy.sql.functions import func
 
 from src import models, schemas
 from src.config import settings
+from src.constants import MAX_DOCUMENT_CONTENT_LENGTH
 from src.crud.collection import get_or_create_collection
 from src.crud.peer import get_peer, reject_scope_observed
 from src.crud.session import get_session
@@ -655,6 +658,62 @@ class _DocumentRowOp:
     fallback_document: schemas.DocumentCreate | None = None
 
 
+# The cap is defined once in src.constants and consumed by models.Document's
+# CHECK constraint, schemas.DocumentCreate and this module, so the API boundary
+# and the table cannot drift apart again.
+_CONTENT_LENGTH_CONSTRAINT = "ck_documents_content_length"
+
+
+@dataclass(frozen=True)
+class DocumentRejection:
+    """A document that could not be persisted, and why.
+
+    Row-level by construction: the batch keeps going, and the caller can report
+    exactly which documents were dropped and for what reason instead of losing
+    every sibling in the same insert.
+    """
+
+    reason: str
+    constraint: str | None = None
+    content_length: int | None = None
+    level: str | None = None
+    session_name: str | None = None
+    content_prefix: str = ""
+
+
+def _constraint_name(exc: IntegrityError) -> str | None:
+    """Best-effort constraint name from a psycopg IntegrityError."""
+    orig = getattr(exc, "orig", None)
+    diag = getattr(orig, "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    if name:
+        return str(name)
+    match = re.search(r'constraint "([^"]+)"', str(orig or exc))
+    return match.group(1) if match else None
+
+
+def _rejection_for(
+    document: schemas.DocumentCreate, exc: IntegrityError
+) -> DocumentRejection:
+    """Describe one row-level insert failure without losing the row's identity."""
+    constraint = _constraint_name(exc)
+    if constraint == _CONTENT_LENGTH_CONSTRAINT:
+        reason = (
+            f"content length {len(document.content)} exceeds the documents.content "
+            f"limit of {MAX_DOCUMENT_CONTENT_LENGTH} characters"
+        )
+    else:
+        reason = f"integrity constraint violation ({constraint or 'unknown constraint'})"
+    return DocumentRejection(
+        reason=reason,
+        constraint=constraint,
+        content_length=len(document.content),
+        level=document.level,
+        session_name=document.session_name,
+        content_prefix=document.content[:80],
+    )
+
+
 @dataclass
 class CreateDocumentsResult:
     created_documents: list[schemas.DocumentCreate] = field(default_factory=list)
@@ -662,6 +721,14 @@ class CreateDocumentsResult:
     exact_dup_existing_count: int = 0
     semantic_dup_rejected_count: int = 0
     semantic_dup_replaced_count: int = 0
+    # Documents that were refused at insert time. Always surfaced to the caller
+    # so a rejected row can never look like a successful, empty result.
+    rejected_documents: list[DocumentRejection] = field(default_factory=list)
+
+    @property
+    def rejected_count(self) -> int:
+        """Number of documents refused by row-level constraints."""
+        return len(self.rejected_documents)
 
 
 async def create_documents(
@@ -694,6 +761,7 @@ async def create_documents(
     """
     honcho_documents: list[models.Document] = []
     accepted_documents: list[schemas.DocumentCreate] = []
+    rejected_documents: list[DocumentRejection] = []
     # Store (document_model, embedding) pairs - IDs aren't available until after commit
     docs_with_embeddings: list[tuple[models.Document, list[float]]] = []
 
@@ -992,7 +1060,94 @@ async def create_documents(
             accepted_documents.append(fallback_doc)
             if fallback_doc.embedding:
                 docs_with_embeddings.append((new_doc, fallback_doc.embedding))
-        db.add_all(honcho_documents)
+        # Insert row by row inside a SAVEPOINT apiece. Previously the whole
+        # batch went through a single `add_all` + `commit`, so one document
+        # violating a table constraint (e.g. ck_documents_content_length,
+        # 65,535 characters) rolled back every sibling in the same inference
+        # call and surfaced as a single ValidationException callers swallowed —
+        # a silent loss.
+        #
+        # Reject, do not truncate: a truncated document is indistinguishable
+        # from a complete one downstream, and its embedding was computed over
+        # the full text, so persisting a prefix would corrupt both the evidence
+        # record and retrieval.
+        persisted_flags: list[bool] = []
+        for _row_index, _new_doc in enumerate(honcho_documents):
+            _source_doc = accepted_documents[_row_index]
+            if len(_source_doc.content) > MAX_DOCUMENT_CONTENT_LENGTH:
+                persisted_flags.append(False)
+                rejected_documents.append(
+                    DocumentRejection(
+                        reason=(
+                            f"content length {len(_source_doc.content)} exceeds the "
+                            f"documents.content limit of {MAX_DOCUMENT_CONTENT_LENGTH} "
+                            "characters"
+                        ),
+                        constraint=_CONTENT_LENGTH_CONSTRAINT,
+                        content_length=len(_source_doc.content),
+                        level=_source_doc.level,
+                        session_name=_source_doc.session_name,
+                        content_prefix=_source_doc.content[:80],
+                    )
+                )
+                logger.error(
+                    "Refusing oversized document for %s/%s/%s/%s: %d characters > %d",
+                    workspace_name,
+                    _source_doc.session_name,
+                    observer,
+                    observed,
+                    len(_source_doc.content),
+                    MAX_DOCUMENT_CONTENT_LENGTH,
+                )
+                continue
+
+            try:
+                # Nested transaction == SAVEPOINT: a failure here rolls back
+                # this row only, leaving the rest of the batch eligible.
+                async with db.begin_nested():
+                    db.add(_new_doc)
+                    await db.flush()
+            except IntegrityError as _exc:
+                persisted_flags.append(False)
+                rejected_documents.append(_rejection_for(_source_doc, _exc))
+                # A failed flush leaves the instance in the session; expunge it
+                # so the next flush does not retry (and re-fail) the same row.
+                with suppress(Exception):
+                    db.expunge(_new_doc)
+                logger.error(
+                    "Rejected document for %s/%s/%s/%s: %s",
+                    workspace_name,
+                    _source_doc.session_name,
+                    observer,
+                    observed,
+                    rejected_documents[-1].reason,
+                )
+                continue
+            persisted_flags.append(True)
+
+        if not all(persisted_flags):
+            # Keep the reported documents and the vector upserts aligned with
+            # what actually landed: a rejected row must not be reported as
+            # created, and its embedding must not reach the vector store.
+            persisted_ids = {
+                id(_model)
+                for _model, _ok in zip(honcho_documents, persisted_flags, strict=True)
+                if _ok
+            }
+            accepted_documents = [
+                _doc
+                for _doc, _ok in zip(accepted_documents, persisted_flags, strict=True)
+                if _ok
+            ]
+            honcho_documents = [
+                _doc
+                for _doc, _ok in zip(honcho_documents, persisted_flags, strict=True)
+                if _ok
+            ]
+            docs_with_embeddings = [
+                _pair for _pair in docs_with_embeddings if id(_pair[0]) in persisted_ids
+            ]
+
         # NOTE
         # If the process crashes after this commit but before vector upsert completes,
         # documents will be left in sync_state='pending' with NULL embeddings.
@@ -1099,6 +1254,7 @@ async def create_documents(
         exact_dup_in_batch_count=exact_dup_in_batch_count,
         semantic_dup_rejected_count=semantic_dup_rejected_count,
         semantic_dup_replaced_count=semantic_dup_replaced_count,
+        rejected_documents=rejected_documents,
     )
 
 
