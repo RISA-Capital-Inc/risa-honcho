@@ -30,7 +30,7 @@ dependencies = [
     "google-genai>=1.32.0",
     "pypdf>=6.21.2",
     "typing-extensions>=4.11.0",
-    "json-repair>=0.49.0",
+    "json-repair>=0.60.1",
     "turbopuffer>=1.8.1",
     "redis>=8.0.1,<9.0.0",
     "cashews[redis]==7.5.0",
